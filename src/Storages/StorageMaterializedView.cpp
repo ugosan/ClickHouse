@@ -928,8 +928,8 @@ void StorageMaterializedView::alter(
     if (has_inner_table)
     {
         auto target_table = getTargetTable();
-        /// Bypass the query's metadata cache, which would otherwise keep serving the snapshot taken
-        /// before the inner table's own alter below.
+        /// Bypass the query's metadata cache: it can hold a snapshot pinned earlier in the query,
+        /// and the columns copied below have to be the inner table's current ones.
         auto target_table_metadata = target_table->getInMemoryMetadataPtr(local_context, /*bypass_metadata_cache=*/true);
 
         /// If this materialized view has an inner table it should always have the same columns as this materialized view.
@@ -937,9 +937,9 @@ void StorageMaterializedView::alter(
         const auto & select_query_output_columns = new_metadata.columns; /// AlterCommands::alter() analyzed the query and assigned `new_metadata.columns` before.
         checkTargetTableHasQueryOutputColumns(target_table_metadata->columns, select_query_output_columns);
 
-        /// The copy below replaces the view's column descriptions with the inner table's, so a column
-        /// comment has to be set there. `isCommentAlter()` also covers the view's own table comment, and
-        /// a command `prepare()` marked ignored (`IF EXISTS`, missing column) is applied to neither table.
+        /// The inner table holds the columns this view reports, so a comment set on the view belongs
+        /// there too. `isCommentAlter()` also covers the view's own table comment, and a command
+        /// `prepare()` marked ignored (`IF EXISTS`, missing column) is applied to neither table.
         AlterCommands column_comment_commands = params;
         std::erase_if(column_comment_commands, [](const AlterCommand & command)
         {
@@ -966,11 +966,29 @@ void StorageMaterializedView::alter(
             /// of the inner table are both held here, so guarding the inner table would be a lock inversion.
             DDLGuardPtr target_ddl_guard;
             target_table->alter(column_comment_commands, target_alter_context, target_alter_lock, target_ddl_guard);
-            target_table_metadata = target_table->getInMemoryMetadataPtr(local_context, /*bypass_metadata_cache=*/true);
         }
 
         /// We need to copy the target table's columns (after checkTargetTableHasQueryOutputColumns() they can be still different - e.g. the data types of those columns can differ).
+        /// Except the comment of each column this statement commented or defined, which stays the view's:
+        /// SharedCatalog replays a comment change as DROP COLUMN plus ADD COLUMN ... COMMENT, which never
+        /// reaches the inner table above. The rest keep the inner table's; MODIFY QUERY rebuilds the view's without.
+        NameSet columns_commented_here;
+        for (const auto & command : params)
+        {
+            if (command.ignore)
+                continue;
+            if (command.type == AlterCommand::COMMENT_COLUMN || command.type == AlterCommand::ADD_COLUMN
+                || (command.type == AlterCommand::MODIFY_COLUMN && command.comment))
+                columns_commented_here.insert(command.column_name);
+        }
+        const auto view_columns = new_metadata.columns;
         new_metadata.columns = target_table_metadata->columns;
+        for (const auto & name : columns_commented_here)
+        {
+            if (!view_columns.has(name) || !new_metadata.columns.has(name))
+                continue;
+            new_metadata.columns.modify(name, [&](ColumnDescription & column) { column.comment = view_columns.get(name).comment; });
+        }
     }
     else
     {
